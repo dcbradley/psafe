@@ -1,0 +1,855 @@
+#!/usr/bin/python3
+
+# PSafe 1.1 by Dan Bradley, 2002
+#
+# If you find bugs or make improvements, feel free to send them my way:
+# dan@hep.wisc.edu
+
+
+import getopt
+import sys
+import os
+import re
+import string
+import getpass
+import base64
+import hashlib
+from Crypto.Cipher import Blowfish
+try:
+	import readline
+except:
+	readline = None
+
+################ Utility Functions ##############
+
+def Encode(v):
+	#Convert a string to a % escaped value.
+	result = ""
+	pos = 0
+	if type(v) != str and type(v) != bytes:
+		v = str(v)
+	#Could be much more restrictive about what gets printed verbatim,
+	#but clear text output is more human readable this way.
+	special = re.compile("[^a-zA-Z0-9_ .:,<>?/~'\"!@#$*()\\-]")
+	while pos < len(v):
+		ch = v[pos]
+		pos = pos + 1
+
+		if type(ch) == int:
+			result = result + "%" + ("%02x" % ch)
+		elif special.search(ch):
+			result = result + "%" + ("%02x" % ord(ch))
+		else:
+			result = result + ch
+
+	return result
+
+def Decode(v):
+	#Convert a % escaped string into the original.
+	result = ""
+	pos = 0
+	while pos < len(v):
+		ch = v[pos]
+		pos = pos + 1
+
+		if ch == "%":
+			ch = v[pos:pos+2]
+			pos = pos + 2
+			ascii_ch = int(ch,16)
+			if ascii_ch >= 128:
+				if type(result) == str:
+					result = result.encode("ascii")
+				result += ascii_ch.to_bytes(1,"little")
+				continue
+			ch = chr(ascii_ch)
+
+		if type(result) == str:
+			result += ch
+		else:
+			result += ord(ch).to_bytes(1,"little")
+
+	return result
+
+def text2dict(text):
+	#Convert key-value pairs in a text string into a dictionary object.
+	#Input format: key1=value1;key2=value2;...
+	#Both keys and values are % escaped.
+
+	dict = {}
+	values = re.split(';',text)
+
+	for v in values:
+		p = re.compile("(.*)=(.*)").search(v)
+		dict[Decode(p.group(1))] = Decode(p.group(2))
+	return dict
+
+def dict2text(dict):
+	#Convert a dictionary object into a key-value text string.
+
+	text = ""
+	keys = dict.keys()
+	for v in sorted(keys):
+		if text: text = text + ";"
+		text = text + Encode(v) + "=" + Encode(dict[v])
+	return text
+
+def real_fname(fname):
+	if fname == "~":
+		return os.environ['HOME']
+	return re.sub("^~/",os.environ['HOME'] + "/",fname)
+
+def file_exists(fname):
+	try:
+		os.stat(fname)
+		return 1
+	except OSError:
+		return 0
+
+#Returns true if path is a directory (symlinks included).
+def IsDirectory(path):
+	try:
+		st_mode = os.stat(path)[0]
+		return st_mode & 0o40000
+	except OSError:
+		return 0
+
+def WildcardsToRE(pattern):
+	pattern = pattern.replace(".","\\.")
+	pattern = pattern.replace("?",".")
+	pattern = pattern.replace("*",".*")
+	return pattern
+
+
+############# PSafe Data Structures ############
+
+class PasswordEntry:
+	def __init__(self):
+		self.value = {}
+
+class PasswordFile:
+	default_crypt = "blowfish"
+	version = 1
+	password = ""
+	password_failed = 0
+	psafe_dir = "~/.psafe"
+	psafe_db = "db"
+	crypt_seed = "rn@Pw|+M" 
+	modified = 0
+	interactive = 1
+
+	def __init__(self):
+		self.entry = {}
+
+	def psafe_file(self,fname):
+		if self.psafe_dir: fname = "/" + fname
+		return real_fname(self.psafe_dir + fname)
+
+	def SetDBFile(self,db_fname):
+		if IsDirectory(db_fname):
+			self.psafe_dir = db_fname
+			return
+
+		psafe_dir = os.path.dirname(db_fname)
+		if psafe_dir:
+			self.psafe_dir = psafe_dir
+		psafe_db = os.path.basename(db_fname)
+		if psafe_db:
+			self.psafe_db = psafe_db
+
+	def Load(self):
+		self.entry = {}
+		self.header_values = {}
+
+		db_fname = self.psafe_file(self.psafe_db)
+		#if not file_exists(db_fname): return 1
+
+		try:
+			f = open(db_fname,"rt")
+		except IOError as e:
+			if e.errno == 2:
+				return 1
+			sys.stderr.write("Failed to open psafe database file: " + str(e) + "\n")
+			sys.exit(1)
+
+		if not f:
+			sys.stderr.write("Failed to open '" + db_fname + "'\n")
+			return 0
+
+		text = f.read()
+		f.close()
+		return self.ParseFile(text)
+
+	def ParseFile(self,text,password_prompt="PSafe Master Password"):
+
+		if not text: return 1
+
+		#First line is a header containing meta information.
+		end = text.find("\n")
+		header = text[0:end]
+		self.header_values = text2dict(header)
+		body = text[end+1:]
+		
+		if "min_version" in self.header_values:
+			min_version = int(self.header_values["min_version"])
+			if min_version > self.version:
+				sys.stderr.write("This version of PSafe is too old to read this file.\n")
+				return 0
+		if "crypt" in self.header_values:
+			crypt_type = self.header_values["crypt"]
+		else:
+			crypt_type = "none"
+
+		if "crypt_check_alg" in self.header_values:
+			crypt_check_alg = self.header_values["crypt_check_alg"]
+			crypt_check_val = self.header_values["crypt_check_val"]
+		else:
+			crypt_check_alg = ""
+
+
+
+		#Undo the body coding (usually base64)
+		if "encoding" in self.header_values:
+			encoding = self.header_values["encoding"]
+		else:
+			encoding = ""
+
+		if encoding == "base64":
+			body = base64.b64decode(body)
+		elif encoding:
+			sys.stderr.write("Unknown encoding type '" + encoding + "'\n")
+			return 0
+
+		retry_count = 0
+		retry_decrypt = 1
+		while retry_decrypt:
+			retry_decrypt = 0
+			if crypt_type != "none" and not self.password:
+				if not self.interactive: return 0
+				self.password = InputPassword(password_prompt)
+
+			#Perform the decryption
+			if crypt_type == "blowfish":
+				if self.password:
+					crypt = Blowfish.new(self.password,Blowfish.MODE_CFB,self.crypt_seed)
+					cleartext = crypt.decrypt(body).decode("utf-8")
+				else: #requesting a password hint
+					cleartext = ""
+			elif crypt_type == "none":
+				cleartext = body
+				crypt_check_alg = ""
+			else:
+				sys.stderr.write("Unknown encryption algorithm: '" + crypt_type + "'\n")
+				return 0
+
+			#Check to see if the password was right.
+			if crypt_check_alg == "MD5":
+				hash = hashlib.md5(cleartext.encode("utf-8"))
+				if type(crypt_check_val) == str:
+					crypt_check_val = crypt_check_val.encode("ascii")
+				if hash.digest() == crypt_check_val:
+					self.password_failed = 0
+				else:
+					self.password_failed = 1
+					if self.password == "hint" or not self.password:
+						if "password_hint" in self.header_values:
+							print( "PSafe Master Password Hint:", )
+							print( self.header_values["password_hint"] )
+						else:
+							print( "No PSafe password hint has been configured." )
+					else:
+						print( "Wrong password!" )
+						if "password_hint" in self.header_values and self.interactive:
+							print( "For a hint, just hit enter." )
+						retry_count = retry_count + 1
+						if not self.interactive: return 0
+						if retry_count >= 4: return 0
+					retry_decrypt = 1
+					self.password = ""
+
+
+
+		text = cleartext
+
+		while len(text):
+			end = text.find('\n')
+			if end == -1: end = len(text)
+
+			line = text[0:end]
+			text = text[end+1:]
+
+			if not line: continue
+
+			e = PasswordEntry()
+			e.value = text2dict(line)
+
+			if not ("name" in e.value):
+				print( "Invalid entry: " + line )
+				return 0
+
+			name = e.value["name"]
+			if name in self.entry:
+				print( "Duplicate entry '" + name + "'" )
+				return 0
+
+			self.entry[name] = e
+
+		return 1
+
+	def Save(self):
+		text = self.MakeText()
+
+		if not file_exists(real_fname(self.psafe_dir)):
+			print( "Creating " + self.psafe_dir + ", where your password database will be stored." )
+			os.mkdir(real_fname(self.psafe_dir),0o700)
+
+		db_fname = self.psafe_file(self.psafe_db)
+		f = open(db_fname,"w+b")
+		if not f:
+			print( "Failed to open '" + db_fname + "'" )
+			return 0
+
+		f.write(text)
+		f.close()
+		self.modified = 0
+		return 1
+
+	def MakeText(self,password_prompt="New PSafe Master Password"):
+		text = ""
+		for k,e in self.entry.items():
+			line = dict2text(e.value)
+			text = text + line + "\n"
+
+		#Build the header information, which is prepended.
+		h = {}
+		h["psafe_version"] = self.version
+
+		crypt_type = self.default_crypt
+		if "crypt" in self.header_values:
+			crypt_type = self.header_values["crypt"]
+
+		if crypt_type != "none" and not self.password:
+			while 1:
+				password = InputPassword(password_prompt)
+				if not password:
+					crypt_type = "none"
+					break
+				password2 = InputPassword("Again to Verify")
+				if password == password2: break
+				print( "Passwords did not match.  Try again." )
+			self.password = password
+
+			if self.password:
+				hint = input("Enter a hint in case you forget this password (optional): ")
+				if hint:
+					h["password_hint"] = hint
+
+		#Generate checksum info so decrypt can be checked.
+		crypt_check_alg = ""
+		crypt_check_val = ""
+		if crypt_type != "none":
+			crypt_check_alg = "MD5"
+			if "crypt_check_alg" in self.header_values:
+				crypt_check_alg = self.header_values["crypt_check_alg"]
+
+
+		if "password_hint" in self.header_values and self.password and not ("password_hint" in h):
+			h["password_hint"] = self.header_values["password_hint"]
+
+		h["crypt"] = crypt_type
+
+		#Perform the encryption
+		if crypt_type == "blowfish":
+			crypt = Blowfish.new(self.password,Blowfish.MODE_CFB,self.crypt_seed)
+
+			#Input text must be integer number of encryption blocks
+			#Or we do not get back exactly what went in (?)
+			while len(text) % crypt.block_size:
+				text = text + '\n'
+
+			body = crypt.encrypt(text)
+		elif crypt_type == "none":
+			body = text
+		else:
+			sys.stderr.write( "Invalid encryption type: '" + crypt_type + "'\n" )
+			return 0
+
+
+		#Choose an encoding.
+		if crypt_type != "none":
+			h["encoding"] = "base64"
+
+		if "encoding" in h:
+			encoding = h["encoding"]
+		else:
+			encoding = ""
+
+		#Apply encoding.
+		if encoding == "base64":
+			body = base64.encodebytes(body)
+
+
+		#Add checksum info to the header.
+		if crypt_check_alg == "MD5":
+			hash = hashlib.md5(text.encode("utf-8"))
+			crypt_check_val = hash.digest()
+
+		if crypt_check_val and crypt_check_alg:
+			h["crypt_check_alg"] = crypt_check_alg
+			h["crypt_check_val"] = crypt_check_val
+
+
+		#Prepend the header line
+		text = dict2text(h).encode("utf-8") + "\n".encode("utf-8") + body
+		
+		return text
+
+	def ImportText(self,text):
+		old_header_values = self.header_values
+		old_password = self.password
+		self.password = ""
+
+		retval = self.ParseFile(text,"Import File Password")
+		self.modified = 1
+
+		self.header_values = old_header_values
+		self.password = old_password
+		return retval
+
+	def ExportText(self):
+		old_password = self.password
+
+		self.password = ""
+		text = self.MakeText("Export File Password")
+
+		self.password = old_password
+		return text
+
+	def GetEntry(self,entry):
+		try:
+			return self.entry[entry]
+		except KeyError:
+			return 0
+
+	def ExpandEntry(self,partial_name):
+		matches = []
+		for entry in self.entry.keys():
+			if entry.find(partial_name) == 0:
+				matches.append(entry)
+		return matches
+
+	def GetMatchingEntry_PrintErrors(self,entry):
+		e = self.GetEntry(entry)
+		if not e:
+			entries = sorted(pfile.FindMatchingEntries(entry))
+			if len(entries) == 1:
+				e = pfile.GetEntry(entries[0])
+			elif len(entries) > 1:
+				print( "The following entries match '" + entry + "'" )
+				for entry in entries:
+					print( entry )
+				return
+		if not e:
+			print( "There is no entry named '" + entry + "'!" )
+		return e
+
+	def GetMatchingEntryName_PrintErrors(self,entry):
+		e = self.GetMatchingEntry_PrintErrors(entry)
+		if e:
+			return e.value["name"]
+		return None
+
+	def FindMatchingEntries(self,pattern,match_var="name",match_any_var=0):
+		if type(match_var) == type(""):
+			match_var = [match_var]
+		matched_entries = {}
+		p = re.compile(WildcardsToRE(pattern),re.IGNORECASE)
+		for entry in self.entry.keys():
+			e = self.GetEntry(entry)
+			for var in e.value.keys():
+				if not match_any_var and var not in match_var: continue
+				value = e.value[var]
+				if p.search(value):
+					matched_entries[entry] = 1
+		return matched_entries.keys()
+
+	def AddPassword(self,entry,password):
+		e = PasswordEntry()
+		e.value["name"] = entry
+		e.value["password"] = password
+		self.entry[entry] = e
+		self.modified = 1
+
+	def ChangeMasterPassword(self,password,hint):
+		self.password = password
+		if not hint:
+			if "password_hint" in self.header_values:
+				del self.header_values["password_hint"]
+		else:
+			self.header_values["password_hint"] = hint
+		self.modified = 1
+
+	def ChangePassword(self,entry,password):
+		e = self.GetEntry(entry)
+		if not e:
+			self.AddPassword(entry,password)
+		else:
+			e.value["password"] = password
+			self.modified = 1
+
+	def SetExtraFieldValue(self,entry,field,data):
+		e = self.GetEntry(entry)
+		if not e:
+			e = PasswordEntry()
+			e.value["name"] = entry
+			self.entry[entry] = e
+		e.value[field] = data
+		self.modified = 1
+
+	def DelPassword(self,entry):
+		if entry in self.entry:
+			del self.entry[entry]
+			self.modified = 1
+
+
+############## User Interface Functions ###############
+
+def InputPassword(prompt):
+	return getpass.getpass(prompt + ": ")
+
+def InputNewPassword(prompt):
+	pass1 = InputPassword(prompt)
+	pass2 = InputPassword("Retype to confirm")
+	if pass1 != pass2:
+		print( "Confirmation password does not match.  Aborting." )
+		return None
+	return pass1
+
+def InputEntryName():
+	if readline: readline.set_completer(entry_completer)
+	name = input("Entry Name: ")
+	if readline: readline.set_completer(None)
+	return name
+
+def InputPattern():
+	return input("Search Pattern: ")
+
+def InputFieldName():
+	return input("Field Name: ")
+
+def InputFieldData():
+	return input("Data: ")
+
+def AddPassword(pfile,entry,password):
+	if pfile.GetEntry(entry):
+		print( "There is already an entry named '" + entry + "'!" )
+	else:
+		pfile.AddPassword(entry,password)
+
+def ChangePassword(pfile,entry,password):
+	entry = pfile.GetMatchingEntryName_PrintErrors(entry)
+	if entry:
+		pfile.ChangePassword(entry,password)
+
+def SetExtraFieldValue(pfile,entry,field,data):
+	entry = pfile.GetMatchingEntryName_PrintErrors(entry)
+	if entry:
+		pfile.SetExtraFieldValue(entry,field,data)
+
+def DelPassword(pfile,entry):
+	entry = pfile.GetMatchingEntryName_PrintErrors(entry)
+	if entry:
+		pfile.DelPassword(entry)
+		print( "Removed " + entry + "." )
+
+def ViewPassword(pfile,entry):
+	e = pfile.GetMatchingEntry_PrintErrors(entry)
+	if e:
+		vars = e.value.keys()
+		for k in sorted(vars):
+			print( k + ": " + e.value[k] )
+
+def SearchEntries(pfile,pattern):
+	entries = pfile.FindMatchingEntries(pattern,match_any_var=1)
+	for entry in sorted(entries):
+		print( entry )
+
+def ListEntries(pfile,pattern=None):
+	if pattern:
+		entries = pfile.FindMatchingEntries(pattern)
+	else:
+		entries = pfile.entry.keys()
+	for entry in sorted(entries):
+		print( entry )
+
+def ImportFile(pfile,fname):
+	f = open(fname,"rb")
+	text = f.read()
+	f.close()
+
+	return pfile.ImportText(text)
+
+def ExportFile(pfile,fname):
+	text = pfile.ExportText()
+
+	if fname:
+		f = open(fname,"w+")
+		f.write(text)
+	else:
+		print( text )
+
+def ExpandResult(text,matches,prompt):
+	if len(matches) == 1:
+		return matches[0]
+	elif len(matches) > 1:
+		print()
+		print( "Possible completions:" )
+		for entry in matches:
+			print( entry )
+
+		#Redraw the input line
+		sys.stdout.write("\n" + prompt + " " + readline.get_line_buffer())
+
+def entry_completer(text,state,prompt="Entry Name:"):
+	if state > 0: return
+
+	matches = pfile.ExpandEntry(text)
+	return ExpandResult(text,matches,prompt)
+
+def command_completer(text,state,prompt="PSafe>"):
+	if state > 0: return
+
+	full_text = readline.get_line_buffer()
+	words = full_text.split()
+	if len(words) == 1:
+		commands = ["add","delete","view","show","list","search","import","export","abort","quit","help","validate","master"]
+		matches = []
+		for command in commands:
+			if command.find(text) == 0:
+				matches.append(command)
+		return ExpandResult(text,matches,prompt)
+	elif len(words) > 1:
+		return entry_completer(text,state,prompt=prompt)
+
+def PrintHelp(logged_in=0):
+	msg = ""
+	if not logged_in:
+		msg = """
+PSafe v1.06 by Dan Bradley
+Usage:
+psafe [options] operation password-name
+"""
+	msg = msg + """
+OPERATIONS:
+  add       (add a new password entry)
+  change    (modify an existing password entry)
+  master    (change master password)
+  delete    (delete a password entry)
+  extra     (add/change an extra field)
+  show/view (view a password)
+  search    (find entries matching pattern)
+  list      (show the names of all password entries or those matching a pattern)
+  import    (add entries from a file)
+  export    (copy entries to a file)
+  validate  (verify master password and database integrity)
+"""
+
+	if not logged_in:
+		msg = msg + """
+  login     (read commands from stdin)
+"""
+	else:
+		msg = msg + """
+  quit      (close PSafe and save changes)
+  abort     (close PSafe without saving changes)
+"""
+
+	if not logged_in:
+		msg = msg + """
+
+OPTIONS:
+  --login_file=F   (read master password from a file)
+  --db=F	   (use database file F)
+"""
+
+	msg = msg + """
+
+NOTE: When referring to entries by name, you may use any unique
+part of the name and you may use wildcards '*' and '?'.  The
+PSafe command line also supports tab completion.
+"""
+
+	sys.stderr.write(msg)
+
+
+def ProcessPSafeCommand(pfile,operation,entry,logged_in=0):
+
+	if operation == "add":
+		if not entry: entry = InputEntryName()
+		password = InputNewPassword("Password to save for " + entry)
+		if password != None:
+			AddPassword(pfile,entry,password)
+	elif operation == "extra":
+		if not entry: entry = InputEntryName()
+		if entry:
+			entry = pfile.GetMatchingEntryName_PrintErrors(entry)
+		if entry:
+			field = InputFieldName()
+			data = InputFieldData()
+			SetExtraFieldValue(pfile,entry,field,data)
+	elif operation == "change":
+		if not entry: entry = InputEntryName()
+		if entry:
+			entry = pfile.GetMatchingEntryName_PrintErrors(entry)
+		if entry:
+			password = InputNewPassword("New password for " + entry)
+			if password != None:
+				ChangePassword(pfile,entry,password)
+	elif operation == "master":
+		password = InputNewPassword("New PSafe Master Password")
+		if password != None:
+			hint = input("Enter a hint in case you forget this password (optional): ")
+			pfile.ChangeMasterPassword(password,hint)
+	elif operation == "del" or operation == "delete":
+		if not entry: entry = InputEntryName()
+		if entry:
+			entry = pfile.GetMatchingEntryName_PrintErrors(entry)
+		if entry:
+			DelPassword(pfile,entry)
+	elif operation == "view" or operation == "show":
+		if not entry: entry = InputEntryName()
+		if entry:
+			entry = pfile.GetMatchingEntryName_PrintErrors(entry)
+		if entry:
+			ViewPassword(pfile,entry)
+	elif operation == "search":
+		if not entry: entry = InputPattern()
+		SearchEntries(pfile,entry)
+	elif operation == "list":
+		ListEntries(pfile,entry)
+	elif operation == "import":
+		if not entry:
+			print( "You must specify a file to import." )
+			sys.exit(1)
+		ImportFile(pfile,entry)
+	elif operation == "export":
+		ExportFile(pfile,entry)
+	elif operation == "abort":
+		if(pfile.modified):
+			print( "Exiting PSafe without saving changes." )
+		else:
+			print( "Exiting PSafe (no changes were made)." )
+		sys.exit(1)
+	elif operation == "validate":
+		print( "PSafe database successfully loaded." )
+		sys.exit(0)
+	elif operation == "help":
+		PrintHelp(logged_in)
+	else:
+		print( "Invalid option '" + operation + "'." )
+		PrintHelp(logged_in)
+
+############ Main Entry Point ###########
+
+operation = "login"
+login_file = None
+login_password = None
+keep_login_file = 0
+interactive = 1
+db_file = None
+
+long_options = [
+	"help",
+	"login_file=",
+	"keep_login_file",
+	"db="
+]
+options,args = getopt.getopt(sys.argv[1:],"h",long_options)
+
+for option,value in options:
+	if option == "-h" or option == "--help":
+		PrintHelp()
+		sys.exit(0)
+	elif option == "--login_file":
+		login_file = value
+		interactive = 0
+	elif option == "--keep_login_file":
+		keep_login_file = 1
+	elif option == "--db":
+		db_file = value
+
+if readline:
+	readline.parse_and_bind("tab: complete")
+	readline.set_completer_delims(" ")
+	readline.set_completer(None)
+
+if login_file:
+	try:
+		F = open(login_file,"r")
+	except IOError as e:
+		sys.stderr.write("Error opening login file!\n")
+		sys.stderr.write(str(e) + "\n")
+		sys.exit(1)
+
+	login_password = F.read()
+	F.close()
+	if not keep_login_file:
+		os.remove(login_file)
+
+	if len(login_password) and login_password[-1] == "\n":
+		login_password = login_password[0:-1]
+
+a = 0
+if len(args) > a:
+	operation = args[a]
+	a = a + 1
+
+if operation == "help":
+	PrintHelp()
+	sys.exit(0)
+
+entry = ""
+if len(args) > a:
+	entry = args[a]
+
+pfile = PasswordFile()
+if db_file:
+	pfile.SetDBFile(db_file)
+pfile.password = login_password
+pfile.interactive = interactive
+
+if not pfile.Load():
+	if pfile.password_failed:
+		#Login failures always exit with status 3
+		sys.exit(3)
+	sys.exit(1)
+
+was_logged_in = 0
+if operation != "login":
+	ProcessPSafeCommand(pfile,operation,entry)
+else:
+	was_logged_in = 1
+	while 1:
+		try:
+			if readline: readline.set_completer(command_completer)
+			command = input("PSafe> ")
+			if readline: readline.set_completer(None)
+		except EOFError:
+			break
+
+		words = command.split()
+		if len(words) == 0: continue
+
+		operation = words[0]
+		entry = ""
+		if len(words) > 1:
+			entry = words[1]
+
+		if operation == "quit" or operation == "logout":
+			break
+		ProcessPSafeCommand(pfile,operation,entry,1)
+
+if pfile.modified:
+	if was_logged_in:
+		print( "Saving changes and exiting." )
+	pfile.Save()
+
