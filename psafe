@@ -20,7 +20,17 @@ import base64
 import hashlib
 try:
 	from cryptography.fernet import Fernet, MultiFernet
-	from cryptography.hazmat.primitives.kdf.argon2 import Argon2id
+	try:
+		from cryptography.hazmat.primitives.kdf.argon2 import Argon2id
+		use_argon2id = 1
+	except:
+		try:
+			from argon2.low_level import Type, hash_secret_raw
+			use_argon2id = 0
+		except:
+			sys.stderr.write("Need cryptography version 44+ or argon2-cffi.\n")
+			sys.exit(1)
+
 	from cryptography.hazmat.primitives.ciphers import Cipher, modes
 	from cryptography.hazmat.decrepit.ciphers import algorithms
 	use_cryptography = 1
@@ -143,8 +153,19 @@ class PasswordEntry:
 		self.value = {}
 
 def fernet_key(password: bytes, salt: bytes) -> bytes:
-    kdf = Argon2id(salt=salt,length=32,iterations=1,lanes=4,memory_cost=2**21)
-    key = base64.urlsafe_b64encode(kdf.derive(password))
+    if use_argon2id:
+        kdf = Argon2id(salt=salt,length=32,iterations=1,lanes=4,memory_cost=2**21)
+        key = base64.urlsafe_b64encode(kdf.derive(password))
+    else:
+        key = hash_secret_raw(
+            password,
+            salt,
+            time_cost=1,  # Same as `iterations`
+            memory_cost=2**21,  # Same as `memory_cost` (in KiB, e.g., 64 MiB)
+            parallelism=4,  # Same as `lanes`
+            hash_len=32,  # Same as `length` (output bytes)
+            type=Type.ID,  # Selects Argon2id
+        )
     return key
 
 FERNET_INVALID_SIGNATURE = "FERNET_INVALID_SIGNATURE"
