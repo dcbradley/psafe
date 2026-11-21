@@ -19,18 +19,18 @@ import getpass
 import base64
 import hashlib
 try:
-        from cryptography.fernet import Fernet, MultiFernet
-        from cryptography.hazmat.primitives.kdf.argon2 import Argon2id
-        from cryptography.hazmat.primitives.ciphers import Cipher, modes
-        from cryptography.hazmat.decrepit.ciphers import algorithms
-        use_cryptography = 1
+	from cryptography.fernet import Fernet, MultiFernet
+	from cryptography.hazmat.primitives.kdf.argon2 import Argon2id
+	from cryptography.hazmat.primitives.ciphers import Cipher, modes
+	from cryptography.hazmat.decrepit.ciphers import algorithms
+	use_cryptography = 1
 except:
-        use_cryptography = 0
-        try:
-                from Crypto.Cipher import Blowfish
-        except:
-                sys.stderr.write("The cryptography module must be installed.\n")
-                sys.exit(1)
+	use_cryptography = 0
+	try:
+		from Crypto.Cipher import Blowfish
+	except:
+		sys.stderr.write("The cryptography module must be installed.\n")
+		sys.exit(1)
 try:
 	import readline
 except:
@@ -141,8 +141,6 @@ def WildcardsToRE(pattern):
 class PasswordEntry:
 	def __init__(self):
 		self.value = {}
-
-FERNET_KEY_SALT = b'&\xc2\x13\x1c\xc4=e\xfb\x1c\xb3o\x82\xc5Qs\xad'
 
 def fernet_key(password: bytes, salt: bytes) -> bytes:
     kdf = Argon2id(salt=salt,length=32,iterations=1,lanes=4,memory_cost=2**21)
@@ -292,7 +290,8 @@ class PasswordFile:
 		else:
 			crypt_check_alg = ""
 
-
+		if "salt" in self.header_values:
+			crypt_salt = base64.urlsafe_b64decode(self.header_values["salt"])
 
 		#Undo the body coding (usually base64)
 		if "encoding" in self.header_values:
@@ -318,7 +317,7 @@ class PasswordFile:
 			if not self.password and crypt_type != "none":
 				cleartext = "" # requesting a password hint
 			elif crypt_type == "fernet":
-				key = fernet_key(self.password.encode("utf8"), FERNET_KEY_SALT)
+				key = fernet_key(self.password.encode("utf8"), crypt_salt)
 				cleartext = fernet_decrypt(key, body)
 				try:
 					if cleartext != FERNET_INVALID_SIGNATURE:
@@ -461,7 +460,9 @@ class PasswordFile:
 
 		#Perform the encryption
 		if crypt_type == "fernet":
-			key = fernet_key(self.password.encode("utf8"),FERNET_KEY_SALT)
+			salt = os.urandom(16)
+			h["salt"] = base64.urlsafe_b64encode(salt).decode("ascii")
+			key = fernet_key(self.password.encode("utf8"),salt)
 			body = fernet_encrypt(key,text.encode("utf8"))
 		elif crypt_type == "blowfish":
 			block_size = 8  # Blowfish block size is always 8 bytes (64 bits)
