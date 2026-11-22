@@ -20,6 +20,10 @@ import base64
 import hashlib
 try:
 	from cryptography.fernet import Fernet, MultiFernet
+	from cryptography.hazmat.primitives.ciphers import Cipher, modes
+	from cryptography.hazmat.decrepit.ciphers import algorithms
+	use_cryptography = 1
+
 	try:
 		from cryptography.hazmat.primitives.kdf.argon2 import Argon2id
 		use_argon2id = 1
@@ -28,19 +32,21 @@ try:
 			from argon2.low_level import Type, hash_secret_raw
 			use_argon2id = 0
 		except:
-			sys.stderr.write("Need cryptography version 44+ or argon2-cffi.\n")
-			sys.exit(1)
+			use_cryptography = 0
 
-	from cryptography.hazmat.primitives.ciphers import Cipher, modes
-	from cryptography.hazmat.decrepit.ciphers import algorithms
-	use_cryptography = 1
 except:
 	use_cryptography = 0
+
+if not use_cryptography:
 	try:
-		from Crypto.Cipher import Blowfish
+    		from Cryptodome.Cipher import Blowfish
 	except:
-		sys.stderr.write("The cryptography module must be installed.\n")
-		sys.exit(1)
+		try:
+			from Crypto.Cipher import Blowfish
+		except:
+			sys.stderr.write("The cryptography module must be installed. If it is less than version 44, argon2 must also be installed.\n")
+			sys.exit(1)
+
 try:
 	import readline
 except:
@@ -212,7 +218,7 @@ def blowfish_encrypt(key: bytes, iv: bytes, plaintext: bytes) -> bytes:
 
     if not use_cryptography:
         crypt = Blowfish.new(key,Blowfish.MODE_CFB,iv)
-        return crypt.encrypt(text.encode("utf8"))
+        return crypt.encrypt(plaintext)
 
     encryptor = Cipher(algorithms.Blowfish(key), modes.ECB()).encryptor()
 
@@ -233,7 +239,7 @@ def blowfish_encrypt(key: bytes, iv: bytes, plaintext: bytes) -> bytes:
 
 
 class PasswordFile:
-	default_crypt = "fernet"
+	default_crypt = "fernet" if use_cryptography else "blowfish"
 	version = 2
 	password = ""
 	password_failed = 0
@@ -338,6 +344,9 @@ class PasswordFile:
 			if not self.password and crypt_type != "none":
 				cleartext = "" # requesting a password hint
 			elif crypt_type == "fernet":
+				if not use_cryptography:
+					sys.stderr.write("The cryptography module must be installed to read this file. If the version is older than 44, the argon2 module must also be installed.\n")
+					sys.exit(1)
 				key = fernet_key(self.password.encode("utf8"), crypt_salt)
 				cleartext = fernet_decrypt(key, body)
 				try:
